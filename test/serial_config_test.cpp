@@ -98,6 +98,9 @@ protected:
                         }
                         Emit() << "Precision: " << device_channel->Precision;
                         Emit() << "ReadOnly: " << device_channel->ReadOnly;
+                        if (device_channel->MaxPublishInterval >= MaxPublishIntervalLowLimit) {
+                            Emit() << "MaxPublishInterval: " << device_channel->MaxPublishInterval.count();
+                        }
                         if (!device_channel->Registers.empty()) {
                             Emit() << "Registers:";
                         }
@@ -185,6 +188,11 @@ TEST_F(TConfigParserTest, ParseRateLimit)
     PrintConfig(GetConfig("configs/parse_test_rate_limit.json"));
 }
 
+TEST_F(TConfigParserTest, ParseMaxPublishInterval)
+{
+    PrintConfig(GetConfig("configs/parse_test_max_publish_interval.json"));
+}
+
 TEST_F(TConfigParserTest, SameSetupItems)
 {
     // Check that setup registers in config have higher priority than setup registers with same addresses from template
@@ -201,6 +209,13 @@ TEST_F(TConfigParserTest, SetupCondition)
 {
     // Check loading device template with setup with condition
     PrintConfig(GetConfig("configs/parse_test_setup_condition.json"));
+}
+
+TEST_F(TConfigParserTest, ParametersFwVariants)
+{
+    // Check loading device template with parameter fw variants:
+    // values from the newest variants pass validation, a single setup item is created per parameter
+    PrintConfig(GetConfig("configs/parse_test_fw_variants.json"));
 }
 
 TEST_F(TConfigParserTest, UnsuccessfulParse)
@@ -236,7 +251,7 @@ TEST_F(TConfigParserTest, MergeDeviceConfigWithTemplate)
     TTemplateMap templateMap(GetTemplatesSchema());
     templateMap.AddTemplatesDir(GetDataFilePath("parser_test/templates/"));
 
-    for (auto i = 1; i <= 13; ++i) {
+    for (auto i = 1; i <= 14; ++i) {
         auto deviceConfig(JSON::Parse(GetDataFilePath("parser_test/merge_template_ok" + to_string(i) + ".json")));
         std::string deviceType = deviceConfig.get("device_type", "").asString();
         auto mergedConfig(MergeDeviceConfigWithTemplate(deviceConfig,
@@ -299,6 +314,31 @@ TEST_F(TConfigParserTest, ParseEnum)
     EXPECT_EQ(titles3.size(), 2);
     EXPECT_EQ(titles3["3"].size(), 0);
     EXPECT_EQ(titles3["4"].size(), 0);
+}
+
+TEST(TFixChannelEnumTest, ConvertsNumbersToStrings)
+{
+    Json::Value channel;
+    channel["enum"][0] = 0;
+    channel["enum"][1] = 1;
+    channel["enum"][2] = "2";
+    channel["enum"][3] = "0x10";
+    FixChannelEnum(channel);
+    ASSERT_TRUE(channel["enum"][0].isString());
+    ASSERT_TRUE(channel["enum"][1].isString());
+    EXPECT_EQ(channel["enum"][0].asString(), "0");
+    EXPECT_EQ(channel["enum"][1].asString(), "1");
+    EXPECT_EQ(channel["enum"][2].asString(), "2");
+    EXPECT_EQ(channel["enum"][3].asString(), "0x10");
+}
+
+TEST(TFixChannelEnumTest, LeavesChannelWithoutEnumUntouched)
+{
+    Json::Value channel;
+    channel["name"] = "test";
+    FixChannelEnum(channel);
+    EXPECT_FALSE(channel.isMember("enum"));
+    EXPECT_EQ(channel["name"].asString(), "test");
 }
 
 TEST_F(TConfigParserTest, DefaultParamsForChannels)

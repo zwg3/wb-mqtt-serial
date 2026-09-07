@@ -1,7 +1,11 @@
 #include "templates_map.h"
 
+#include <algorithm>
 #include <filesystem>
+#include <map>
+#include <unordered_set>
 
+#include "common_utils.h"
 #include "expression_evaluator.h"
 #include "file_utils.h"
 #include "json_common.h"
@@ -15,9 +19,39 @@ using namespace WBMQTT::JSON;
 
 namespace
 {
+    //! Template sections whose items may have a "condition"
+    const std::vector<std::string> CONDITION_SECTIONS = {"channels", "setup", "parameters"};
+
+    //! Must be equal in all declarations of a parameter. The "fw" may differ (fw variants)
+    const std::vector<std::string> COMMON_PARAMETER_PROPERTIES = {SerialConfig::WRITE_ADDRESS_PROPERTY_NAME,
+                                                                  SerialConfig::ADDRESS_PROPERTY_NAME};
+
+    //! Define how a register is read and converted, must be equal in all declarations
+    //! of a parameter used in conditions and in all fw variants of a parameter. Kept in sync with LoadRegisterConfig
+    const std::vector<std::string> REGISTER_READING_PROPERTIES =
+        {"reg_type", "format", "scale", "offset", "round_to", "word_order", "byte_order"};
+
     bool EndsWith(const string& str, const string& suffix)
     {
         return str.size() >= suffix.size() && str.compare(str.size() - suffix.size(), suffix.size(), suffix) == 0;
+    }
+
+    void FixChannelsEnum(Json::Value& node)
+    {
+        if (node.isObject()) {
+            if (node.isMember("channels") && node["channels"].isArray()) {
+                for (Json::Value& channel: node["channels"]) {
+                    FixChannelEnum(channel);
+                }
+            }
+            for (const auto& member: node.getMemberNames()) {
+                FixChannelsEnum(node[member]);
+            }
+        } else if (node.isArray()) {
+            for (Json::Value& item: node) {
+                FixChannelsEnum(item);
+            }
+        }
     }
 
     void CheckNesting(const Json::Value& root, size_t nestingLevel, TSubDevicesTemplateMap& templates)
@@ -41,14 +75,7 @@ namespace
     void ValidateConditionAndAddDependencies(Json::Value& node, Expressions::TExpressionsCache& exprCache)
     {
         if (node.isMember("condition")) {
-            auto condition = node["condition"].asString();
-            auto itExpr = exprCache.find(condition);
-            if (itExpr == exprCache.end()) {
-                Expressions::TParser parser;
-                parser.Parse(condition);
-                itExpr = exprCache.emplace(condition, parser.Parse(condition)).first;
-            }
-            const auto dependencies = Expressions::GetDependencies(itExpr->second.get());
+            const auto dependencies = Expressions::GetDependencies(node["condition"].asString(), exprCache);
             if (!dependencies.empty()) {
                 Json::Value dependenciesArray(Json::arrayValue);
                 for (const auto& dep: dependencies) {
@@ -110,17 +137,22 @@ namespace
         }
     }
 
-    void ValidateAndAnnotateTemplateSections(Json::Value& deviceTemplate, const std::string& protocol)
+    void ValidateTemplateSections(const Json::Value& deviceTemplate, const std::string& protocol)
     {
         Expressions::TExpressionsCache exprCache;
         const bool restrictWriteAddress = ProtocolRestrictsWriteAddress(protocol);
-        std::vector<std::string> sections = {"channels", "setup", "parameters"};
-        for (const auto& section: sections) {
+        for (const auto& section: CONDITION_SECTIONS) {
             if (deviceTemplate.isMember(section)) {
-                Json::Value& sectionNodes = deviceTemplate[section];
+                const Json::Value& sectionNodes = deviceTemplate[section];
                 for (auto it = sectionNodes.begin(); it != sectionNodes.end(); ++it) {
                     try {
-                        ValidateConditionAndAddDependencies(*it, exprCache);
+                        if (it->isMember("condition")) {
+                            auto condition = (*it)["condition"].asString();
+                            if (exprCache.find(condition) == exprCache.end()) {
+                                Expressions::TParser parser;
+                                exprCache.emplace(condition, parser.Parse(condition));
+                            }
+                        }
                     } catch (const runtime_error& e) {
                         throw runtime_error("Failed to parse condition in " + section + "[" +
                                             GetNodeName(*it, it.name()) + "]: " + e.what());
@@ -138,44 +170,128 @@ namespace
         }
     }
 
-    bool CheckParameterProperty(std::unordered_map<std::string, Json::Value>& map,
-                                const Json::Value& parameter,
-                                const std::string& propertyName,
-                                std::string& error)
+    //! Collects ids of the parameters referenced in conditions.
+    //! Conditions are already validated by ValidateTemplateSections, so parse errors are not decorated here
+    std::unordered_set<std::string> CollectConditionParameterIds(const Json::Value& deviceTemplate)
     {
-        std::string id = parameter["id"].asString();
-        Json::Value value = parameter[propertyName];
-        auto it = map.find(id);
-        if (it != map.end() && it->second != value) {
-            error = "Parameter \"" + id + "\" has several declarations with different \"" + propertyName +
-                    "\" values (" + (it->second.isNull() ? "[null]" : it->second.asString()) + " and " +
-                    (value.isNull() ? "[null]" : value.asString()) + "). ";
-            return false;
+        std::unordered_set<std::string> res;
+        Expressions::TExpressionsCache exprCache;
+        for (const auto& section: CONDITION_SECTIONS) {
+            for (const auto& node: deviceTemplate[section]) {
+                auto dependencies = Expressions::GetDependencies(node["condition"].asString(), exprCache);
+                res.insert(dependencies.begin(), dependencies.end());
+            }
         }
-        map[id] = value;
-        return true;
+        return res;
     }
 
-    void ValidateParameterProperties(const Json::Value& parameters)
+    void AddDependenciesToTemplateSections(Json::Value& deviceTemplate)
     {
+        Expressions::TExpressionsCache exprCache;
+        for (const auto& section: CONDITION_SECTIONS) {
+            if (deviceTemplate.isMember(section)) {
+                Json::Value& sectionNodes = deviceTemplate[section];
+                for (auto it = sectionNodes.begin(); it != sectionNodes.end(); ++it) {
+                    ValidateConditionAndAddDependencies(*it, exprCache);
+                }
+            }
+        }
+    }
+
+    //! Throws if the declarations of the parameter differ in any of the properties, values are compared as written
+    void CheckEqualProperties(const std::string& id,
+                              const Json::Value& a,
+                              const Json::Value& b,
+                              const std::vector<std::string>& propertyNames)
+    {
+        for (const auto& propertyName: propertyNames) {
+            auto aValue = a[propertyName].asString();
+            auto bValue = b[propertyName].asString();
+            if (aValue != bValue) {
+                throw std::runtime_error("Parameter \"" + id + "\" has several declarations with different \"" +
+                                         propertyName + "\" values (\"" + aValue + "\" and \"" + bValue + "\").");
+            }
+        }
+    }
+
+    void ValidateParameterProperties(const Json::Value& deviceTemplate)
+    {
+        const Json::Value& parameters = deviceTemplate["parameters"];
         if (!parameters.isArray()) {
             return;
         }
-        std::unordered_map<std::string, Json::Value> writeAddressMap;
-        std::unordered_map<std::string, Json::Value> addressMap;
-        std::unordered_map<std::string, Json::Value> fwVersionMap;
-        std::string error;
+        auto conditionParameters = CollectConditionParameterIds(deviceTemplate);
+        std::unordered_map<std::string, const Json::Value*> firstDeclarations;
         for (const auto& parameter: parameters) {
-            if (!CheckParameterProperty(writeAddressMap, parameter, SerialConfig::WRITE_ADDRESS_PROPERTY_NAME, error) ||
-                !CheckParameterProperty(addressMap, parameter, SerialConfig::ADDRESS_PROPERTY_NAME, error) ||
-                !CheckParameterProperty(fwVersionMap, parameter, SerialConfig::FW_VERSION_PROPERTY_NAME, error))
-            {
-                break;
+            auto id = parameter["id"].asString();
+            auto insertRes = firstDeclarations.emplace(id, &parameter);
+            if (insertRes.second) {
+                continue;
             }
+            const auto& firstDeclaration = *insertRes.first->second;
+            auto propertyNames = COMMON_PARAMETER_PROPERTIES;
+            if (conditionParameters.count(id)) {
+                propertyNames.insert(propertyNames.end(),
+                                     REGISTER_READING_PROPERTIES.begin(),
+                                     REGISTER_READING_PROPERTIES.end());
+            }
+            CheckEqualProperties(id, firstDeclaration, parameter, propertyNames);
         }
-        if (!error.empty()) {
-            throw std::runtime_error(
-                error + "All parameter declarations with the same id must have the same addresses and FW versions.");
+    }
+
+    bool EnumContains(const Json::Value& enumValues, const Json::Value& value)
+    {
+        return std::any_of(enumValues.begin(), enumValues.end(), [&value](const Json::Value& item) {
+            return item.asString() == value.asString();
+        });
+    }
+
+    //! Checks fw variants of parameters: the declarations with the same id and condition and different "fw".
+    //! The device firmware version is unknown during config validation and setup creation,
+    //! so the variants must define the same register and value conversion and differ only in the enum values,
+    //! a variant with a higher "fw" may only add values. The addresses are checked for all declarations
+    //! of a parameter by ValidateParameterProperties
+    void ValidateParameterFwVariants(const Json::Value& deviceTemplate)
+    {
+        const Json::Value& parameters = deviceTemplate["parameters"];
+        if (!parameters.isArray()) {
+            return;
+        }
+        auto getFw = [](const Json::Value& declaration) {
+            return declaration[SerialConfig::FW_VERSION_PROPERTY_NAME].asString();
+        };
+        std::map<std::pair<std::string, std::string>, std::vector<const Json::Value*>> groups;
+        for (const auto& parameter: parameters) {
+            groups[{parameter["id"].asString(), parameter["condition"].asString()}].push_back(&parameter);
+        }
+        for (auto& [key, declarations]: groups) {
+            const auto& id = key.first;
+            std::stable_sort(declarations.begin(),
+                             declarations.end(),
+                             [&getFw](const Json::Value* a, const Json::Value* b) {
+                                 return util::CompareVersionStrings(getFw(*a), getFw(*b)) < 0;
+                             });
+            for (size_t i = 1; i < declarations.size(); ++i) {
+                const auto& previous = *declarations[i - 1];
+                const auto& declaration = *declarations[i];
+                if (getFw(previous) == getFw(declaration)) {
+                    throw std::runtime_error("Parameter \"" + id + "\" has several declarations with the same \"" +
+                                             SerialConfig::FW_VERSION_PROPERTY_NAME + "\" value (\"" +
+                                             getFw(declaration) + "\") and the same condition.");
+                }
+                CheckEqualProperties(id, previous, declaration, REGISTER_READING_PROPERTIES);
+                if (previous.isMember("enum") != declaration.isMember("enum")) {
+                    throw std::runtime_error("Parameter \"" + id + "\" fw variants \"" + getFw(previous) + "\" and \"" +
+                                             getFw(declaration) + "\" must both have \"enum\" or both have none.");
+                }
+                for (const auto& value: previous["enum"]) {
+                    if (!EnumContains(declaration["enum"], value)) {
+                        throw std::runtime_error("Parameter \"" + id + "\" fw variant \"" + getFw(declaration) +
+                                                 "\" removes enum value \"" + value.asString() + "\" of fw variant \"" +
+                                                 getFw(previous) + "\", fw variants may only add enum values.");
+                    }
+                }
+            }
         }
     }
 
@@ -197,12 +313,50 @@ namespace
             device["parameters"] = std::move(parametersArray);
         }
     }
+
+    //! Throws std::runtime_error if the template is invalid. Doesn't modify the template
+    void ValidateDeviceTemplate(const Json::Value& root, WBMQTT::JSON::TValidator& validator)
+    {
+        validator.Validate(root);
+        ValidateTemplateSections(root["device"], root["device"].get("protocol", "modbus").asString());
+        // Check declarations with the same id (for parameters declared as array)
+        ValidateParameterProperties(root["device"]);
+        ValidateParameterFwVariants(root["device"]);
+        // Check that channels refer to valid subdevices and they are not nested too deep
+        if (root["device"].isMember("subdevices")) {
+            TSubDevicesTemplateMap subdevices(root["device_type"].asString(), root["device"]);
+            CheckNesting(root, 0, subdevices);
+        }
+    }
+
+    //! Converts numeric channel enum values to strings
+    void FixDeviceTemplate(Json::Value& root)
+    {
+        FixChannelsEnum(root);
+    }
+
+    void FixAndValidateDeviceTemplate(Json::Value& root, WBMQTT::JSON::TValidator& validator)
+    {
+        FixDeviceTemplate(root);
+        ValidateDeviceTemplate(root, validator);
+    }
+
+    //! Prepares a valid template for use: adds condition dependencies, normalizes parameters
+    void AnnotateDeviceTemplate(Json::Value& root)
+    {
+        AddDependenciesToTemplateSections(root["device"]);
+        if (!root["device"].isMember("subdevices")) {
+            ConvertParametersObjectToArray(root);
+        }
+    }
 }
 
 //=============================================================================
 //                                TTemplateMap
 //=============================================================================
-TTemplateMap::TTemplateMap(const Json::Value& templateSchema): Validator(new WBMQTT::JSON::TValidator(templateSchema))
+TTemplateMap::TTemplateMap(const Json::Value& templateSchema, const std::string& userTemplatesDir)
+    : Validator(new WBMQTT::JSON::TValidator(templateSchema)),
+      UserTemplatesDir(userTemplatesDir)
 {}
 
 PDeviceTemplate TTemplateMap::MakeTemplateFromJson(const Json::Value& data, const std::string& filePath)
@@ -231,6 +385,9 @@ PDeviceTemplate TTemplateMap::MakeTemplateFromJson(const Json::Value& data, cons
         deviceTemplate->SetHardware(hws);
     }
     deviceTemplate->SetMqttId(data["device"].get("id", "").asString());
+    if (!UserTemplatesDir.empty() && WBMQTT::StringStartsWith(filePath, UserTemplatesDir)) {
+        deviceTemplate->SetUserDefined();
+    }
     return deviceTemplate;
 }
 
@@ -301,7 +458,9 @@ std::vector<std::string> TTemplateMap::UpdateTemplate(const std::string& path)
     auto deviceTemplate = MakeTemplateFromJson(WBMQTT::JSON::Parse(path), path);
     auto& typeArray = Templates.try_emplace(deviceTemplate->Type, std::vector<PDeviceTemplate>{}).first->second;
     if (!PreferredTemplatesDir.empty() && WBMQTT::StringStartsWith(path, PreferredTemplatesDir)) {
-        TemplateUpdatedWarning(typeArray.back(), path);
+        if (!typeArray.empty()) {
+            TemplateUpdatedWarning(typeArray.back(), path);
+        }
         typeArray.push_back(deviceTemplate);
     } else {
         typeArray.insert(typeArray.begin(), deviceTemplate);
@@ -338,6 +497,27 @@ std::string TTemplateMap::DeleteTemplate(const std::string& path)
     return DeleteTemplateUnsafe(path);
 }
 
+void TTemplateMap::ValidateTemplate(const Json::Value& templateRoot)
+{
+    std::unique_lock m(Mutex);
+    if (!Validator) {
+        throw std::runtime_error("Device templates schema is not loaded");
+    }
+    Json::Value root(templateRoot);
+    FixAndValidateDeviceTemplate(root, *Validator);
+}
+
+PDeviceTemplate TTemplateMap::FindUserDefinedTemplate(const std::string& deviceType)
+{
+    std::unique_lock m(Mutex);
+    auto it = Templates.find(deviceType);
+    if (it == Templates.end()) {
+        return nullptr;
+    }
+    auto item = std::find_if(it->second.rbegin(), it->second.rend(), [](const auto& t) { return t->IsUserDefined(); });
+    return item != it->second.rend() ? *item : nullptr;
+}
+
 //=============================================================================
 //                              TDeviceTemplate
 //=============================================================================
@@ -347,6 +527,7 @@ TDeviceTemplate::TDeviceTemplate(const std::string& type,
                                  const std::string& filePath)
     : Type(type),
       Deprecated(false),
+      UserDefined(false),
       Validator(validator),
       FilePath(filePath),
       Subdevices(false),
@@ -388,6 +569,16 @@ void TDeviceTemplate::SetDeprecated()
     Deprecated = true;
 }
 
+bool TDeviceTemplate::IsUserDefined() const
+{
+    return UserDefined;
+}
+
+void TDeviceTemplate::SetUserDefined()
+{
+    UserDefined = true;
+}
+
 void TDeviceTemplate::SetGroup(const std::string& group)
 {
     if (!group.empty()) {
@@ -417,20 +608,13 @@ const Json::Value& TDeviceTemplate::GetTemplate()
         // Skip deprecated template validation, it may be broken according to latest schema
         if (!IsDeprecated()) {
             try {
-                Validator->Validate(root);
-                ValidateAndAnnotateTemplateSections(root["device"], Protocol);
-                // Check that parameters with same ids have same addresses (for parameters declared as array)
-                ValidateParameterProperties(root["device"]["parameters"]);
+                FixAndValidateDeviceTemplate(root, *Validator);
             } catch (const std::runtime_error& e) {
                 throw std::runtime_error("File: " + GetFilePath() + " error: " + e.what());
             }
-            // Check that channels refer to valid subdevices and they are not nested too deep
-            if (WithSubdevices()) {
-                TSubDevicesTemplateMap subdevices(Type, root["device"]);
-                CheckNesting(root, 0, subdevices);
-            } else {
-                ConvertParametersObjectToArray(root);
-            }
+            AnnotateDeviceTemplate(root);
+        } else {
+            FixDeviceTemplate(root);
         }
         Template = root["device"];
     }

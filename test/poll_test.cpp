@@ -14,6 +14,16 @@ namespace
     const auto DISCONNECTED_POLL_DELAY_STEP = 500ms;
     const auto DISCONNECTED_POLL_DELAY_LIMIT = 10s;
 
+    // 2028-02-29 23:59:59 UTC, fake system time of time synchronization tests
+    const time_t FAKE_SYSTEM_TIME = 1835481599;
+
+    // Modbus exception code that is not treated as unsupported register
+    const uint8_t SLAVE_DEVICE_FAILURE = 0x04;
+
+    // Devices are set to local time, not to UTC. POSIX form of UTC+3 is used to avoid dependency on tzdata
+    const char* FAKE_TIMEZONE = "MSK-3";
+    const time_t FAKE_LOCAL_TIME = FAKE_SYSTEM_TIME + duration_cast<seconds>(3h).count();
+
     class TTimeMock
     {
         steady_clock::time_point Time;
@@ -84,7 +94,10 @@ public:
     void SetUp() override
     {
         TLoggedFixture::SetUp();
+        setenv("TZ", FAKE_TIMEZONE, 1);
+        tzset();
         TimeMock.Reset();
+        SystemTime = system_clock::from_time_t(FAKE_SYSTEM_TIME);
         Port = std::make_shared<TFakeSerialPortWithTime>(*this, TimeMock);
         FeaturePort = std::make_shared<TFeaturePort>(Port, false);
         TModbusDevice::Register(DeviceFactory);
@@ -94,6 +107,8 @@ public:
     void TearDown() override
     {
         FeaturePort->Close();
+        unsetenv("TZ");
+        tzset();
         TLoggedFixture::TearDown();
     }
 
@@ -122,6 +137,21 @@ public:
     {
         SetModbusRTUSlaveId(slaveId);
         Port->Expect(WrapPDU({
+                         0x03, // function code
+                         0x00, // starting address Hi
+                         0x72, // starting address Lo
+                         0x00, // quantity Hi
+                         0x01  // quantity Lo
+                     }),
+                     WrapPDU({
+                         0x03, // function code
+                         0x02, // byte count
+                         0x00, // data Hi
+                         0x00  // data Lo
+                     }),
+                     __func__,
+                     readTime);
+        Port->Expect(WrapPDU({
                          0x06, // function code
                          0x00, // starting address Hi
                          0x72, // starting address Lo
@@ -135,6 +165,36 @@ public:
                          0x00, // value Hi
                          0x01  // value Lo
                      }),
+                     __func__,
+                     readTime);
+    }
+
+    void EnqueueWriteLocalTime(uint8_t slaveId, uint64_t localTime, microseconds readTime, uint8_t exceptionCode = 0)
+    {
+        SetModbusRTUSlaveId(slaveId);
+        std::vector<int> request = {
+            0x10, // function code
+            0x01, // starting address Hi
+            0xC4, // starting address Lo
+            0x00, // quantity Hi
+            0x04, // quantity Lo
+            0x08  // byte count
+        };
+        for (auto i = 0; i < 8; ++i) {
+            request.push_back((localTime >> (56 - i * 8)) & 0xFF);
+        }
+        Port->Expect(WrapPDU(request),
+                     exceptionCode ? WrapPDU({
+                                         0x90,         // function code + exception bit
+                                         exceptionCode //
+                                     })
+                                   : WrapPDU({
+                                         0x10, // function code
+                                         0x01, // starting address Hi
+                                         0xC4, // starting address Lo
+                                         0x00, // quantity Hi
+                                         0x04  // quantity Lo
+                                     }),
                      __func__,
                      readTime);
     }
@@ -259,6 +319,54 @@ public:
                      readTime);
     }
 
+    // Full control over an EVENTS_REQUEST (0x46/0x10): explicit min_slave and confirmation
+    // state in the request plus an arbitrary response. Used to drive the read-cap logic that
+    // the simpler EnqueueReadEvents helpers cannot express.
+    void EnqueueEventsExchange(microseconds readTime,
+                               uint8_t minSlave,
+                               uint8_t confirmSlave,
+                               uint8_t confirmFlag,
+                               const std::vector<int>& responsePdu,
+                               uint8_t responderSlaveId)
+    {
+        SetModbusRTUSlaveId(0xFD);
+        Port->Expect(WrapPDU({
+                         0x46,                    // function code
+                         0x10,                    // subcommand
+                         minSlave,                // starting slaveId
+                         MAX_EVENT_RESPONSE_SIZE, // max response size
+                         confirmSlave,            // confirmed slaveId
+                         confirmFlag              // confirmed flag
+                     }),
+                     WrapPDU(responsePdu, responderSlaveId),
+                     __func__,
+                     readTime);
+    }
+
+    // HAS_EVENTS response PDU carrying one holding-register change event.
+    std::vector<int> HoldingEventResponse(uint8_t flag, uint16_t addr, uint16_t value)
+    {
+        return {
+            0x46,                // function code
+            0x11,                // subcommand: has events
+            flag,                // confirmation flag
+            0x01,                // event count
+            0x06,                // events data length
+            0x02,                // event data size
+            0x03,                // event type: holding
+            (addr >> 8) & 0xFF,  // event id (register address) Hi
+            addr & 0xFF,         // event id Lo
+            (value >> 8) & 0xFF, // value Hi
+            value & 0xFF         // value Lo
+        };
+    }
+
+    // NO_EVENTS response PDU (sent by a device with the broadcast address 0xFD).
+    std::vector<int> NoEventsResponse()
+    {
+        return {0x46, 0x12};
+    }
+
     PExpector Expector() const override
     {
         return Port;
@@ -298,6 +406,7 @@ public:
     std::shared_ptr<TFakeSerialPortWithTime> Port;
     std::shared_ptr<TFeaturePort> FeaturePort;
     TTimeMock TimeMock;
+    system_clock::time_point SystemTime;
     TSerialDeviceFactory DeviceFactory;
 };
 
@@ -987,4 +1096,217 @@ TEST_F(TPollTest, SuspendAndResumeWithEvents)
         EnqueueReadEvents(4ms);
         Cycle(serialClient, lastAccessedDevice);
     }
+}
+
+TEST_F(TPollTest, EventsCapLimitsConsecutiveReadsFromSameDevice)
+{
+    // A device that always has events must not monopolize the event bus.
+    // After MAX_CONSECUTIVE_EVENT_READS_PER_SLAVE (5) reads in a row from the same
+    // device the master excludes it from arbitration by raising min_slave to
+    // slaveId + 1. The device is polled again from the next reading session.
+
+    Port->SetBaudRate(115200);
+    auto config = MakeDeviceConfig("device1", "1");
+    config.CommonConfig->RequestDelay = 10ms;
+    auto device = MakeDevice(config);
+    AddRegister(*device, 1, 0ms, TRegisterConfig::TSporadicMode::ONLY_EVENTS);
+
+    TSerialClientRegisterAndEventsReader serialClient({device}, 50ms, [this]() { return TimeMock.GetTime(); });
+    TSerialClientDeviceAccessHandler lastAccessedDevice(serialClient.GetEventsReader());
+
+    // Enable events and read the register once
+    EnqueueEnableEvents(1, 1, 10ms);
+    EnqueueReadHolding(1, 1, 1, 10ms);
+    Cycle(serialClient, lastAccessedDevice);
+
+    // A single event-reading session. Device 1 answers five times in a row.
+    EnqueueEventsExchange(4ms, 0, 0, 0, HoldingEventResponse(0, 1, 0x1234), 1);
+    EnqueueEventsExchange(4ms, 1, 1, 0, HoldingEventResponse(0, 1, 0x1234), 1);
+    EnqueueEventsExchange(4ms, 1, 1, 0, HoldingEventResponse(0, 1, 0x1234), 1);
+    EnqueueEventsExchange(4ms, 1, 1, 0, HoldingEventResponse(0, 1, 0x1234), 1);
+    EnqueueEventsExchange(4ms, 1, 1, 0, HoldingEventResponse(0, 1, 0x1234), 1);
+    // Cap reached: device 1 is excluded, min_slave becomes 2 (device 1 is still confirmed).
+    // NO_EVENTS ends the session; the next session starts again from min_slave 0.
+    EnqueueEventsExchange(4ms, 2, 1, 0, NoEventsResponse(), 0xFD);
+    Cycle(serialClient, lastAccessedDevice);
+}
+
+TEST_F(TPollTest, EventsCapPersistsBetweenReadingSessions)
+{
+    // The read-cap must accumulate ACROSS reading sessions: at low baud rates a single
+    // session (bounded by poll time) fits only a couple of reads, so a per-session counter
+    // would never reach the cap. Here each session fits exactly two reads (60ms each vs
+    // 100ms poll time); the cap (5) is reached only if the streak survives the session
+    // boundaries. The fifth overall read (in the third session) triggers the skip.
+
+    Port->SetBaudRate(115200);
+    auto config = MakeDeviceConfig("device1", "1");
+    config.CommonConfig->RequestDelay = 10ms;
+    auto device = MakeDevice(config);
+    AddRegister(*device, 1, 0ms, TRegisterConfig::TSporadicMode::ONLY_EVENTS);
+
+    TSerialClientRegisterAndEventsReader serialClient({device}, 50ms, [this]() { return TimeMock.GetTime(); });
+    TSerialClientDeviceAccessHandler lastAccessedDevice(serialClient.GetEventsReader());
+
+    // Enable events and read the register once
+    EnqueueEnableEvents(1, 1, 10ms);
+    EnqueueReadHolding(1, 1, 1, 10ms);
+    Cycle(serialClient, lastAccessedDevice);
+
+    // Session 1: two reads from device 1 (session ends by timeout, streak = 2 is kept)
+    EnqueueEventsExchange(60ms, 0, 0, 0, HoldingEventResponse(0, 1, 0x1234), 1);
+    EnqueueEventsExchange(60ms, 1, 1, 0, HoldingEventResponse(0, 1, 0x1234), 1);
+    Cycle(serialClient, lastAccessedDevice);
+
+    // Session 2: two more reads, still min_slave 1 (streak carried over, now 4)
+    EnqueueEventsExchange(60ms, 1, 1, 0, HoldingEventResponse(0, 1, 0x1234), 1);
+    EnqueueEventsExchange(60ms, 1, 1, 0, HoldingEventResponse(0, 1, 0x1234), 1);
+    Cycle(serialClient, lastAccessedDevice);
+
+    // Session 3: the fifth read reaches the cap -> skip to min_slave 2 -> NO_EVENTS ends the session
+    EnqueueEventsExchange(60ms, 1, 1, 0, HoldingEventResponse(0, 1, 0x1234), 1);
+    EnqueueEventsExchange(60ms, 2, 1, 0, NoEventsResponse(), 0xFD);
+    Cycle(serialClient, lastAccessedDevice);
+
+    // Session 4: back to min_slave 0, the bus is now quiet
+    EnqueueEventsExchange(60ms, 0, 0, 0, NoEventsResponse(), 0xFD);
+    Cycle(serialClient, lastAccessedDevice);
+}
+
+TEST_F(TPollTest, TimeSync)
+{
+    // One register, time synchronization every 24 hours
+    // 1. Local time must be written after the first read
+    // 2. No new write during the interval
+    // 3. Local time must be written again after the interval
+
+    Port->SetBaudRate(115200);
+
+    auto config = MakeDeviceConfig("device1", "1");
+    config.CommonConfig->TimeSyncInterval = 24h;
+
+    auto device = MakeDevice(config);
+    AddRegister(*device, 1);
+
+    TSerialClientRegisterAndEventsReader serialClient(
+        {device},
+        50ms,
+        [this]() { return TimeMock.GetTime(); },
+        [this]() { return SystemTime; });
+    TSerialClientDeviceAccessHandler lastAccessedDevice(serialClient.GetEventsReader());
+
+    EnqueueReadHolding(1, 1, 1, 10ms);
+    EnqueueWriteLocalTime(1, FAKE_LOCAL_TIME, 10ms);
+    Cycle(serialClient, lastAccessedDevice);
+
+    EnqueueReadHolding(1, 1, 1, 10ms);
+    Cycle(serialClient, lastAccessedDevice);
+
+    SystemTime += 23h;
+    EnqueueReadHolding(1, 1, 1, 10ms);
+    Cycle(serialClient, lastAccessedDevice);
+
+    SystemTime += 2h;
+    EnqueueReadHolding(1, 1, 1, 10ms);
+    EnqueueWriteLocalTime(1, FAKE_LOCAL_TIME + duration_cast<seconds>(25h).count(), 10ms);
+    Cycle(serialClient, lastAccessedDevice);
+}
+
+TEST_F(TPollTest, TimeSyncDisabled)
+{
+    // Zero interval disables time synchronization, only registers are read
+
+    Port->SetBaudRate(115200);
+
+    auto config = MakeDeviceConfig("device1", "1");
+    config.CommonConfig->TimeSyncInterval = TimeSyncDisabled;
+
+    auto device = MakeDevice(config);
+    AddRegister(*device, 1);
+
+    TSerialClientRegisterAndEventsReader serialClient(
+        {device},
+        50ms,
+        [this]() { return TimeMock.GetTime(); },
+        [this]() { return SystemTime; });
+    TSerialClientDeviceAccessHandler lastAccessedDevice(serialClient.GetEventsReader());
+
+    for (size_t i = 0; i < 3; ++i) {
+        EnqueueReadHolding(1, 1, 1, 10ms);
+        Cycle(serialClient, lastAccessedDevice);
+        SystemTime += 25h;
+    }
+}
+
+TEST_F(TPollTest, TimeSyncTransientFailure)
+{
+    // One register, time synchronization every 24 hours
+    // Device fails to write local time, but the register is supported,
+    // so the attempt is repeated on the next poll
+
+    Port->SetBaudRate(115200);
+
+    auto config = MakeDeviceConfig("device1", "1");
+    config.CommonConfig->TimeSyncInterval = 24h;
+
+    auto device = MakeDevice(config);
+    AddRegister(*device, 1);
+
+    TSerialClientRegisterAndEventsReader serialClient(
+        {device},
+        50ms,
+        [this]() { return TimeMock.GetTime(); },
+        [this]() { return SystemTime; });
+    TSerialClientDeviceAccessHandler lastAccessedDevice(serialClient.GetEventsReader());
+
+    EnqueueReadHolding(1, 1, 1, 10ms);
+    EnqueueWriteLocalTime(1, FAKE_LOCAL_TIME, 10ms, SLAVE_DEVICE_FAILURE);
+    Cycle(serialClient, lastAccessedDevice);
+
+    EnqueueReadHolding(1, 1, 1, 10ms);
+    EnqueueWriteLocalTime(1, FAKE_LOCAL_TIME, 10ms);
+    Cycle(serialClient, lastAccessedDevice);
+}
+
+TEST_F(TPollTest, TimeSyncNotSupported)
+{
+    // One register, time synchronization every 24 hours
+    // 1. Device replies with ILLEGAL_DATA_ADDRESS to the local time write on the first poll
+    // 2. No new attempts while the device is connected, even after the interval
+    // 3. The attempt is repeated after reconnect
+
+    Port->SetBaudRate(115200);
+
+    auto config = MakeDeviceConfig("device1", "1");
+    config.CommonConfig->TimeSyncInterval = 24h;
+    config.CommonConfig->DeviceTimeout = 0ms;
+    config.CommonConfig->DeviceMaxFailCycles = 1;
+
+    auto device = MakeDevice(config);
+    AddRegister(*device, 1);
+
+    TSerialClientRegisterAndEventsReader serialClient(
+        {device},
+        50ms,
+        [this]() { return TimeMock.GetTime(); },
+        [this]() { return SystemTime; });
+    TSerialClientDeviceAccessHandler lastAccessedDevice(serialClient.GetEventsReader());
+
+    EnqueueReadHolding(1, 1, 1, 10ms);
+    EnqueueWriteLocalTime(1, FAKE_LOCAL_TIME, 10ms, Modbus::ILLEGAL_DATA_ADDRESS);
+    Cycle(serialClient, lastAccessedDevice);
+    EXPECT_EQ(device->GetConnectionState(), TDeviceConnectionState::CONNECTED);
+
+    SystemTime += 25h;
+    EnqueueReadHolding(1, 1, 1, 10ms);
+    Cycle(serialClient, lastAccessedDevice);
+
+    EnqueueReadHoldingError(1, 1, 1, 10ms);
+    Cycle(serialClient, lastAccessedDevice);
+    EXPECT_EQ(device->GetConnectionState(), TDeviceConnectionState::DISCONNECTED);
+
+    EnqueueReadHolding(1, 1, 1, 10ms);
+    EnqueueWriteLocalTime(1, FAKE_LOCAL_TIME + duration_cast<seconds>(25h).count(), 10ms);
+    Cycle(serialClient, lastAccessedDevice);
+    EXPECT_EQ(device->GetConnectionState(), TDeviceConnectionState::CONNECTED);
 }

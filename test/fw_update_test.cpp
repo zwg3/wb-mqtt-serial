@@ -39,6 +39,7 @@ public:
     {
         auto errIt = Errors.find(url);
         if (errIt != Errors.end()) {
+            RequestCount[url]++;
             throw std::runtime_error(errIt->second);
         }
         auto it = TextResponses.find(url);
@@ -53,6 +54,7 @@ public:
     {
         auto errIt = Errors.find(url);
         if (errIt != Errors.end()) {
+            RequestCount[url]++;
             throw std::runtime_error(errIt->second);
         }
         auto it = BinaryResponses.find(url);
@@ -649,6 +651,66 @@ TEST_F(FwDownloaderTest, CacheHit)
     EXPECT_EQ(firstCount, secondCount);
 }
 
+TEST_F(FwDownloaderTest, CacheOnlyLookupDoesNotUseNetwork)
+{
+    auto fwUrl = "https://fw-releases.wirenboard.com/fw/by-signature/release-versions.yaml";
+    auto bootUrl = "https://fw-releases.wirenboard.com/boot/by-signature/release-versions.yaml";
+    FakeHttp->SetTextResponse(fwUrl,
+                              "releases:\n"
+                              "  sig1:\n"
+                              "    suite1: fw/path/1.0.0.wbfw\n");
+    FakeHttp->SetTextResponse(bootUrl,
+                              "releases:\n"
+                              "  sig1:\n"
+                              "    suite1: boot/path/2.0.0.wbfw\n");
+
+    EXPECT_THROW(Downloader.GetReleasedFirmware("sig1", "suite1", ENetworkAccess::CacheOnly), std::runtime_error);
+    EXPECT_THROW(Downloader.GetReleasedBootloader("sig1", "suite1", ENetworkAccess::CacheOnly), std::runtime_error);
+    EXPECT_EQ(FakeHttp->GetRequestCount(fwUrl), 0);
+    EXPECT_EQ(FakeHttp->GetRequestCount(bootUrl), 0);
+}
+
+TEST_F(FwDownloaderTest, PrefetchedIndexesAreAvailableForCacheOnlyLookups)
+{
+    auto fwUrl = "https://fw-releases.wirenboard.com/fw/by-signature/release-versions.yaml";
+    auto bootUrl = "https://fw-releases.wirenboard.com/boot/by-signature/release-versions.yaml";
+    FakeHttp->SetTextResponse(fwUrl,
+                              "releases:\n"
+                              "  sig1:\n"
+                              "    suite1: fw/path/1.0.0.wbfw\n");
+    FakeHttp->SetTextResponse(bootUrl,
+                              "releases:\n"
+                              "  sig1:\n"
+                              "    suite1: boot/path/2.0.0.wbfw\n");
+
+    Downloader.PrefetchReleaseIndexes();
+
+    EXPECT_EQ(Downloader.GetReleasedFirmware("sig1", "suite1", ENetworkAccess::CacheOnly).Version, "1.0.0");
+    EXPECT_EQ(Downloader.GetReleasedBootloader("sig1", "suite1", ENetworkAccess::CacheOnly).Version, "2.0.0");
+    EXPECT_EQ(FakeHttp->GetRequestCount(fwUrl), 1);
+    EXPECT_EQ(FakeHttp->GetRequestCount(bootUrl), 1);
+}
+
+TEST_F(FwDownloaderTest, PrefetchIgnoresDownloadErrors)
+{
+    FakeHttp->SetError("https://fw-releases.wirenboard.com/fw/by-signature/release-versions.yaml", "Timeout");
+    FakeHttp->SetError("https://fw-releases.wirenboard.com/boot/by-signature/release-versions.yaml", "Timeout");
+
+    EXPECT_NO_THROW(Downloader.PrefetchReleaseIndexes());
+}
+
+TEST_F(FwDownloaderTest, FailedDownloadIsNotRetriedImmediately)
+{
+    auto url = "https://fw-releases.wirenboard.com/fw/by-signature/release-versions.yaml";
+    FakeHttp->SetError(url, "Timeout was reached");
+
+    EXPECT_THROW(Downloader.GetReleasedFirmware("sig1", "suite1"), std::runtime_error);
+    EXPECT_THROW(Downloader.GetReleasedFirmware("sig1", "suite1"), std::runtime_error);
+    Downloader.PrefetchReleaseIndexes();
+
+    EXPECT_EQ(FakeHttp->GetRequestCount(url), 1);
+}
+
 // ============================================================
 //           Shared Modbus test helpers
 // ============================================================
@@ -1083,7 +1145,7 @@ TEST_F(TFwTaskTest, GetInfoGarbageVersionsSanitized)
     task->Run(FeaturePort, *AccessHandler, EmptyDeviceList);
 
     ASSERT_TRUE(gotResult);
-    EXPECT_EQ(resultInfo.FwVersion, "");        // garbage dropped at source
+    EXPECT_EQ(resultInfo.FwVersion, "");         // garbage dropped at source
     EXPECT_EQ(resultInfo.BootloaderVersion, ""); // garbage dropped at source
     EXPECT_EQ(resultInfo.DeviceModel, "EFAN");
 }
@@ -1447,11 +1509,10 @@ protected:
 
     PFwUpdateState MakeState()
     {
-        return std::make_shared<TFwUpdateState>(
-            [this](const std::string& topic, const std::string& payload, bool retain) {
-                PublishLog.push_back({topic, payload, retain});
-            },
-            "/test/state");
+        return std::make_shared<TFwUpdateState>([this](const std::string& topic,
+                                                       const std::string& payload,
+                                                       bool retain) { PublishLog.push_back({topic, payload, retain}); },
+                                                "/test/state");
     }
 
     // Helper: call MakePortRequestJson
@@ -1668,13 +1729,13 @@ TEST_F(FwHandlerTest, IsPrintableAsciiPlain)
 {
     EXPECT_TRUE(IsPrintableAscii("3.7.0"));
     EXPECT_TRUE(IsPrintableAscii("WB-MSW v.3")); // spaces and dots are printable
-    EXPECT_TRUE(IsPrintableAscii("")); // empty is trivially printable
+    EXPECT_TRUE(IsPrintableAscii(""));           // empty is trivially printable
 }
 
 TEST_F(FwHandlerTest, IsPrintableAsciiControlChar)
 {
     EXPECT_FALSE(IsPrintableAscii(std::string("\x0F"
-                                              "F")));      // control char
+                                              "F")));        // control char
     EXPECT_FALSE(IsPrintableAscii(std::string("\x01\x02"))); // control chars
     EXPECT_FALSE(IsPrintableAscii(std::string("ab\x7F")));   // DEL is not printable
 }
@@ -1700,9 +1761,9 @@ TEST_F(FwHandlerTest, IsValidFwSignatureEmpty)
 TEST_F(FwHandlerTest, IsValidFwSignatureGarbage)
 {
     EXPECT_FALSE(IsValidFwSignature(std::string("\x0F"
-                                                "F")));      // control char
+                                                "F")));       // control char
     EXPECT_FALSE(IsValidFwSignature(std::string("\xC0sig"))); // high byte
-    EXPECT_FALSE(IsValidFwSignature(std::string("ab\x01"))); // control char in the middle
+    EXPECT_FALSE(IsValidFwSignature(std::string("ab\x01")));  // control char in the middle
 }
 
 TEST_F(FwHandlerTest, SanitizeVersionString)
@@ -2375,6 +2436,26 @@ TEST_F(FwHandlerIntegrationTest, GetFirmwareInfoNormal)
     EXPECT_TRUE(LastResult["bootloader_has_update"].asBool());
 }
 
+TEST_F(FwHandlerIntegrationTest, GetFirmwareInfoWithoutNetwork)
+{
+    auto fwUrl = "https://fw-releases.wirenboard.com/fw/by-signature/release-versions.yaml";
+    auto bootUrl = "https://fw-releases.wirenboard.com/boot/by-signature/release-versions.yaml";
+    FakeHttp->SetError(fwUrl, "Timeout was reached");
+    FakeHttp->SetError(bootUrl, "Timeout was reached");
+    EnqueueBasicGetInfoResponses("wbled", "3.6.1", "1.5.0", "WB-LED");
+
+    CallGetFirmwareInfo(MakeRequest());
+
+    ASSERT_TRUE(GotResult);
+    ASSERT_FALSE(GotError);
+    EXPECT_EQ(LastResult["fw"].asString(), "3.6.1");
+    EXPECT_EQ(LastResult["available_fw"].asString(), "");
+    EXPECT_FALSE(LastResult["can_update"].asBool());
+    // Only the prefetch is allowed to access network, the task itself must not
+    EXPECT_EQ(FakeHttp->GetRequestCount(fwUrl), 1);
+    EXPECT_EQ(FakeHttp->GetRequestCount(bootUrl), 1);
+}
+
 TEST_F(FwHandlerIntegrationTest, GetFirmwareInfoActiveUpdate)
 {
     TDeviceUpdateInfo info;
@@ -2469,8 +2550,7 @@ TEST_F(FwHandlerIntegrationTest, UpdateBootloader)
     SetupReleasesYaml();
     SetupBootloaderInfo("wbled", "2.0.0");
     std::vector<uint8_t> wbfwData(168, 0xBB);
-    FakeHttp->SetBinaryResponse("https://fw-releases.wirenboard.com/boot/by-signature/wbled/main/2.0.0.wbfw",
-                                wbfwData);
+    FakeHttp->SetBinaryResponse("https://fw-releases.wirenboard.com/boot/by-signature/wbled/main/2.0.0.wbfw", wbfwData);
 
     EnqueueBasicGetInfoResponses("wbled", "3.6.1", "1.5.0", "WB-LED");
     EnqueueFlashExpectations(true, true);

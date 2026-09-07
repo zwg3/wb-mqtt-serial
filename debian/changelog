@@ -1,3 +1,281 @@
+wb-mqtt-serial (2.270.1) stable; urgency=medium
+
+  * Remove max_publish_interval from the channels settings table schema
+
+ -- Ilya Titov <ilya.titov@wirenboard.com>  Wed, 02 Sep 2026 11:47:23 +0300
+
+wb-mqtt-serial (2.270.0) stable; urgency=medium
+
+  * Add max_publish_interval option for devices and channels
+
+ -- Ilya Titov <ilya.titov@wirenboard.com>  Wed, 02 Sep 2026 09:36:41 +0300
+
+wb-mqtt-serial (2.269.1) stable; urgency=medium
+
+  * Do not report an unknown parity value as "U" in port/Scan RPC response.
+    If the parity register holds an unexpected value, the parity field is
+    omitted from the device settings, as for a register that was not read,
+    and read_serial_params_error is reported
+
+ -- Petr Krasnoshchekov <petr.krasnoshchekov@wirenboard.com>  Fri, 28 Aug 2026 12:00:00 +0400
+
+wb-mqtt-serial (2.269.0) stable; urgency=medium
+
+  * Allow several declarations of a device template parameter with the same
+    id and different fw, so that a newer firmware can extend the enum of the
+    parameter. The template validator requires the declarations to read the
+    same register identically and rejects removed enum values
+
+ -- Petr Krasnoshchekov <petr.krasnoshchekov@wirenboard.com>  Tue, 25 Aug 2026 12:00:00 +0400
+
+wb-mqtt-serial (2.268.0) stable; urgency=medium
+
+  * Evaluate declaration conditions in device/Set and device/Load RPC: a
+    channel or parameter is written and a parameter is read by the
+    declaration whose condition is true, so condition variants with
+    different scales are converted right (wb-mai6, wb-mai2-cc,
+    oni-plc-w-ema-06u00). device/Set evaluates the conditions over the
+    request values and reads the missing condition parameters from the
+    device. An item with false conditions is skipped by device/Set and is
+    not included in the device/Load answer, an item with several matching
+    declarations rejects the request
+  * Skip a readonly or unknown parameter in a device/Set request instead of
+    rejecting the request
+  * Reject writing a read only channel in device/Set by the register type
+    too, not only by the "readonly" key: a write to an input or discrete
+    register used to reach the device and fail there
+  * Require numbers as device/Set parameter values, like the device
+    configuration schema does
+  * Do not fail device/Load and device/Set when a condition parameter got no
+    value: the device does not support the register or the value matches
+    the "error_value", "unsupported_value" or Wiren Board 0xFFFE marker. The
+    conditions over it are evaluated with an undefined value like in the
+    web interface: comparisons are false, "!=" is true, "isDefined" is false
+  * Return "unsupported" in the device/Load answer only for an item whose own
+    register was not read, list only channels in the readonly array and
+    read only the condition parameters of the requested items
+  * Check the Wiren Board 0xFFFE marker in device/LoadConfig before resolving
+    conditions, a parameter depending on an unsupported register is not
+    resolved by the number 65534
+  * Remove the register address from the readonly heating_options parameter
+    of the WBE2-I-OPENTHERM fw 1.7.3 template, readonly parameters only
+    organize the web interface
+
+ -- Petr Krasnoshchekov <petr.krasnoshchekov@wirenboard.com>  Tue, 25 Aug 2026 12:00:00 +0400
+
+wb-mqtt-serial (2.267.1) stable; urgency=medium
+
+  * Restore continuous read register value after RPC requests
+
+ -- Ilya Titov <ilya.titov@wirenboard.com>  Tue, 25 Aug 2026 10:29:06 +0300
+
+wb-mqtt-serial (2.267.0) stable; urgency=medium
+
+  * Add wb_time_sync_interval device parameter
+  * Rename unixtime control type to local_time
+
+ -- Ilya Titov <ilya.titov@wirenboard.com>  Mon, 24 Aug 2026 10:30:49 +0300
+
+wb-mqtt-serial (2.266.0) stable; urgency=medium
+
+  * Do not write continuous read register if continuous read is already enabled
+
+ -- Ilya Titov <ilya.titov@wirenboard.com>  Mon, 24 Aug 2026 10:21:35 +0300
+
+wb-mqtt-serial (2.265.0) stable; urgency=medium
+
+  * Check that declarations of a parameter used in conditions read and convert
+    the register identically. A device template violating the rule is rejected
+    on first use and on templates/Upload
+
+ -- Petr Krasnoshchekov <petr.krasnoshchekov@wirenboard.com>  Fri, 21 Aug 2026 12:00:00 +0400
+
+wb-mqtt-serial (2.264.3) stable; urgency=medium
+
+  * Clear fw-update RPC and firmware update state topics on service stop
+
+ -- Nikolay Korotkiy <nikolay.korotkiy@wirenboard.com>  Tue, 18 Aug 2026 13:00:00 +0400
+
+wb-mqtt-serial (2.264.2) stable; urgency=medium
+
+  * Fix offset descriptions in templates with multisensor 1-Wire support (WB-MS v.2, WB-MIR v.3, WB-M1W2 v.3)
+
+ -- Ilia Skochilov <ilia.skochilov@wirenboard.com>  Mon, 17 Aug 2026 11:37:53 +0300
+
+wb-mqtt-serial (2.264.1) stable; urgency=medium
+
+  * Fix Carel template titles
+
+ -- Ilia Skochilov <ilia.skochilov@wirenboard.com>  Mon, 17 Aug 2026 10:19:33 +0300
+
+wb-mqtt-serial (2.264.0) stable; urgency=medium
+
+  * Add temperature offset registers for templates with multisensor 1-Wire support (WB-MS v.2, WB-MIR v.3, WB-M1W2 v.3)
+
+ -- Ilia Skochilov <ilia.skochilov@wirenboard.com>  Thu, 13 Aug 2026 14:09:51 +0300
+
+wb-mqtt-serial (2.263.2) stable; urgency=medium
+
+  * Clarify max_read_registers applies to coils and discrete inputs too
+
+ -- Alexander Kuznetsov <alexander.kuznetsov@wirenboard.com>  Tue, 11 Aug 2026 14:12:19 +0300
+
+wb-mqtt-serial (2.263.1) stable; urgency=medium
+
+  * Fix templates/Upload RPC numeric channel enum values validation
+  * Fix device/Load RPC failure for WB devices with enum channels
+
+ -- Ilya Titov <ilya.titov@wirenboard.com>  Tue, 11 Aug 2026 10:54:17 +0300
+
+wb-mqtt-serial (2.263.0) stable; urgency=medium
+
+  * Move firmware release indexes download from port thread to RPC thread
+
+ -- Ilya Titov <ilya.titov@wirenboard.com>  Fri, 07 Aug 2026 11:24:52 +0300
+
+wb-mqtt-serial (2.262.6) stable; urgency=medium
+
+  * Finish unifying displayed UI texts across the remaining WB families
+    (display-only): WB-MAO4 (mao4, mao4-20ma, mao4-20ma-fw-2.9), WB-MDM3,
+    WB-MSW (v3/v4/v4_lora), WB-MIR (v2/v2-buttons/v3/v3-fw-4.35) — Serial
+    Number, Firmware Version, Supply Voltage, Min Supply/MCU Voltage Since
+    Startup; RU "одиночных нажатий"; for WB-MAO4 the press-counter display is
+    aligned (Short->Single, Shortlong) via translations only — channel names
+    (MQTT topics) are unchanged. Also add the missing Serial Number / Firmware
+    Version display texts to the WB-MAO4/MDM3/LED/MRGBW-D fw-variant templates
+    from the earlier migration, and fix a "воспроизведена" typo in WB-MSW/MIR
+    descriptions. Only current (g-wb) templates. Validate.dat unchanged.
+
+ -- Pavel Gasheev <pavel.gasheev@wirenboard.com>  Thu, 06 Aug 2026 15:00:00 +0300
+
+wb-mqtt-serial (2.262.5) stable; urgency=medium
+
+  * Unify displayed UI texts across several WB families (display-only): WB-MAI
+    (MAI11/MAI2-CC/MAI6), WB-MIO, WB-UPS v.3, WB-DALI, WB-MCM8, WB-MS v.2,
+    WB-MWAC (MWAC/MWAC2/MWAC2 ver.2), WB-M1W2, WB-LED, WB-MRGBW-D. Canonical
+    texts — Serial Number, Firmware Version, Supply Voltage, Min Supply Voltage
+    Since Startup, Min MCU Voltage Since Startup; RU "одиночных нажатий" for the
+    single-press counter; fix a Cyrillic homoglyph ("сhange"->"change") in the
+    WB-MWAC/WB-MWAC2 safety-behaviour enum title. Only current (g-wb) templates
+    are touched. Channel names (MQTT topics) are not changed — backward
+    compatible, Validate.dat unchanged.
+
+ -- Pavel Gasheev <pavel.gasheev@wirenboard.com>  Thu, 06 Aug 2026 12:00:00 +0300
+
+wb-mqtt-serial (2.262.4) stable; urgency=medium
+
+  * WB-MR relay family templates (WB-MR3, WB-MR6C/-NC/CU/v.3, WB-MRM2-mini/NO,
+    WB-MRM2-mini/NC, WB-MRWM2): unify displayed UI texts for entities named
+    differently across templates — Serial Number, Firmware Version, Supply
+    Voltage, Min Supply Voltage Since Startup, Min MCU Voltage Since Startup;
+    RU "одиночных нажатий" for the single-press counter; fix a Cyrillic
+    homoglyph ("сhange"→"change") in the WB-MRWM2 safety-behaviour enum title.
+    Only current (g-wb) templates are touched; obsolete g-wb-old ones are left
+    as is. Channel names (MQTT topics) are not changed — backward compatible,
+    Validate.dat unchanged.
+
+ -- Pavel Gasheev <pavel.gasheev@wirenboard.com>  Wed, 05 Aug 2026 18:02:10 +0300
+
+wb-mqtt-serial (2.262.3) stable; urgency=medium
+
+  * WB-MAO4, WB-MDM3, WB-MRGBW-D, WB-LED templates: unify UI texts for
+    entities that are named differently across the templates, translate
+    placeholder group titles, fix the WB-MAO4 safety group carrying the
+    power-up description, and drop 8 duplicate unused group ids in WB-LED
+
+ -- Nikolay Oleinik <nikolay.oleinik@wirenboard.com>  Tue, 04 Aug 2026 00:42:00 +0700
+
+wb-mqtt-serial (2.262.2) stable; urgency=medium
+
+  * Fix deps
+
+ -- Nikolay Korotkiy <nikolay.korotkiy@wirenboard.com>  Mon, 03 Aug 2026 12:20:00 +0400
+
+wb-mqtt-serial (2.262.1) stable; urgency=medium
+
+  * Fix coverage reporting with GNU make 4.4 (trixie): export coverage
+    variables from debian/rules instead of MAKEFLAGS
+
+ -- Ekaterina Volkova <ekaterina.volkova@wirenboard.com>  Fri, 31 Jul 2026 09:28:51 +0000
+
+wb-mqtt-serial (2.262.0) stable; urgency=medium
+
+  * Add buttons functionality to WB-MCM8HV template
+  * Bring WB-MCM8HV template in line with WB-STD-001/002/003
+
+ -- Nikolay Oleinik <nikolay.oleinik@wirenboard.com>  Wed, 29 Jul 2026 22:49:00 +0700
+
+wb-mqtt-serial (2.261.1) stable; urgency=medium
+
+  * Regenerate config if the existing one is empty
+
+ -- Vladimir Zuevskiy <vladimir.zuevskiy@wirenboard.com>  Fri, 24 Jul 2026 11:45:31 +0300
+
+wb-mqtt-serial (2.261.0) stable; urgency=medium
+
+  * Fix endless fast modbus events reading from the flooding device
+
+ -- Maxim Toropov <maxim.toropov@wirenboard.com>  Tue, 28 Jul 2026 17:36:00 +0300
+
+wb-mqtt-serial (2.260.4) stable; urgency=medium
+
+  * Fix clang-tidy, no functional changes
+
+ -- Nikolay Korotkiy <nikolay.korotkiy@wirenboard.com>  Mon, 27 Jul 2026 10:20:00 +0400
+
+wb-mqtt-serial (2.260.3) stable; urgency=medium
+
+  * Fix clang-format, no functional changes
+
+ -- Nikolay Korotkiy <nikolay.korotkiy@wirenboard.com>  Thu, 23 Jul 2026 14:20:00 +0400
+
+wb-mqtt-serial (2.260.2) stable; urgency=medium
+
+  * Clarify timeouts and register reading documentation
+
+ -- Alexander Kilpio <alexander.kilpio@wirenboard.com>  Wed, 22 Jul 2026 13:00:43 +0300
+
+wb-mqtt-serial (2.260.1) stable; urgency=medium
+
+  * Fix write retry on a disconnected device
+
+ -- Ilya Titov <ilya.titov@wirenboard.com>  Tue, 21 Jul 2026 11:11:31 +0300
+
+wb-mqtt-serial (2.260.0) stable; urgency=medium
+
+  * config/Load RPC: device types with the active template loaded from
+    the user templates directory are marked with "user-defined" flag
+  * New templates/Upload and templates/Delete RPC methods to manage
+    user defined device templates
+  * Files watcher handles file moves (mv) in templates directories
+
+ -- Petr Krasnoshchekov <petr.krasnoshchekov@wirenboard.com>  Fri, 17 Jul 2026 16:10:43 +0500
+
+wb-mqtt-serial (2.259.2) stable; urgency=medium
+
+  * Convert numeric channel enum values to strings
+
+ -- Ilya Titov <ilya.titov@wirenboard.com>  Tue, 14 Jul 2026 10:37:12 +0300
+
+wb-mqtt-serial (2.259.1) stable; urgency=medium
+
+  * Fix possible crash on live reload of a device template file
+    with a unique device type
+
+ -- Petr Krasnoshchekov <petr.krasnoshchekov@wirenboard.com>  Mon, 13 Jul 2026 10:44:18 +0500
+
+wb-mqtt-serial (2.259.0) stable; urgency=medium
+
+  * ONOKOM templates update (external contribution):
+    - add GR-5-MB-B and PN-1-MB-B device templates
+    - add "External air temperature" channel to all devices (gated by the
+      "Allow the use of an external temperature sensor" setting, off by default)
+    - add "Idu count" channel translation for VRF devices
+    - add error-data channels to the ME-1-MB-B template
+    - refresh the remaining non-deprecated ONOKOM templates
+
+ -- external contributor: zwg3 <zwg.work.mail@gmail.com>  Wed, 08 Jul 2026 12:00:00 +0300
+
 wb-mqtt-serial (2.258.0) stable; urgency=medium
 
   * Take the released bootloader version from boot/by-signature/release-versions.yaml by the
